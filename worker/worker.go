@@ -69,7 +69,7 @@ func PostJob(w http.ResponseWriter, r *http.Request) {
 	hash := crypto.SHA256.New()
 	hash.Write([]byte(strconv.Itoa(rand.Int())))
 	sum := hash.Sum(nil)
-	jobId := hex.EncodeToString(sum[:])[:16]
+	jobId := hex.EncodeToString(sum)[:16]
 
 	job.JobId = jobId
 	job.Status = "queued"
@@ -80,6 +80,7 @@ func PostJob(w http.ResponseWriter, r *http.Request) {
 	mux.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
 	if err := json.NewEncoder(w).Encode(job); err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
@@ -101,13 +102,7 @@ func DeleteJob(w http.ResponseWriter, r *http.Request) {
 	delete(jobs, job_id)
 	mux.Unlock()
 
-	mux.RLock()
-	if _, ok := jobs[job_id]; !ok {
-		w.WriteHeader(http.StatusNoContent)
-		mux.RUnlock()
-		return
-	}
-	mux.RUnlock()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func DoJob() {
