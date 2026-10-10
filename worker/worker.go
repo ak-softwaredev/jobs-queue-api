@@ -1,23 +1,27 @@
 package worker
 
 import (
-	"crypto"
-	"encoding/hex"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"log"
 	"net/http"
-	"strconv"
 	"sync"
-	"time"
+
+	"github.com/expr-lang/expr"
 )
 
 var availableJobs = []string{
 	"echo",
+	"eval",
 }
 
 var jobs = make(map[string]Job) // Temporary until i decide to use a database
 var mux = sync.RWMutex{}
+var jobQueue = make(chan string, 1024)
+
+var submit_mux sync.RWMutex
+var shuttingDown bool
 
 type Job struct {
 	JobId   string `json:"job_id"`
@@ -48,6 +52,14 @@ func GetJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func PostJob(w http.ResponseWriter, r *http.Request) {
+	submit_mux.RLock()
+	defer submit_mux.RUnlock()
+
+	if shuttingDown {
+		http.Error(w, "service shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
 	job := Job{}
 	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -66,18 +78,32 @@ func PostJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hash := crypto.SHA256.New()
-	hash.Write([]byte(strconv.Itoa(rand.Int())))
-	sum := hash.Sum(nil)
-	jobId := hex.EncodeToString(sum)[:16]
+	jobId := rand.Text()[:16]
+
+	mux.Lock()
+	for jobs[jobId] != (Job{}) {
+		jobId = rand.Text()[:16]
+	}
 
 	job.JobId = jobId
 	job.Status = "queued"
-	job.Result = "nil"
+	job.Result = ""
 
-	mux.Lock()
 	jobs[jobId] = job
 	mux.Unlock()
+
+	select {
+	case jobQueue <- jobId:
+		// job added, no action
+	default:
+		mux.Lock()
+		delete(jobs, jobId)
+		mux.Unlock()
+
+		log.Printf("job %s not added to queue: channel full?", jobId)
+		http.Error(w, "job queue full", http.StatusServiceUnavailable)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -106,51 +132,92 @@ func DeleteJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func DoJob() {
-	for {
-		var job Job
-		var job_id string
-		var found = false
-		mux.Lock()
-		for id_k, job_v := range jobs {
-			if job_v.Status == "queued" {
-				job_v.Status = "in_progress"
-				jobs[id_k] = job_v
-				job = job_v
-				job_id = id_k
-				found = true
-				break
-			}
-		}
-		mux.Unlock()
-
-		if !found {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		switch {
-		case job.Type == "echo":
-			job.Result = job.Payload
-			job.Status = "completed"
-			fmt.Printf("%v\n", job)
-		// case job.Type == "cmd":
-		// 	cmd := exec.Command("sh", "-c", job.Payload)
-		// 	output, err := cmd.CombinedOutput()
-		// 	if err != nil {
-		// 		job.Result = fmt.Sprintf("%s\n", err)
-		// 		job.Status = "failed"
-		// 		return
-		// 	}
-		// 	job.Result = string(output)
-		// 	job.Status = "completed"
-		default:
-			job.Result = "unknown job type"
-			job.Status = "failed"
-			fmt.Printf("%v\n", job)
-		}
-
-		mux.Lock()
-		jobs[job_id] = job
-		mux.Unlock()
+	for jobId := range jobQueue {
+		jobCycle(jobId)
 	}
+}
+
+func jobCycle(job_id string) bool {
+	mux.Lock()
+	job, ok := jobs[job_id]
+	if !ok {
+		mux.Unlock()
+		log.Printf("job %s does not exist!", job_id)
+		return false
+	}
+	job.Status = "in_progress"
+	jobs[job_id] = job
+	mux.Unlock()
+
+	switch {
+	case job.Type == "echo":
+		job.echo()
+	// case job.Type == "cmd":
+	// 	cmd := exec.Command("sh", "-c", job.Payload)
+	// 	output, err := cmd.CombinedOutput()
+	// 	if err != nil {
+	// 		job.Result = fmt.Sprintf("%s\n", err)
+	// 		job.Status = "failed"
+	// 		return
+	// 	}
+	// 	job.Result = string(output)
+	// 	job.Status = "completed"
+	case job.Type == "eval":
+		job.evaluate()
+	default:
+		job.Result = "unknown job type"
+		job.Status = "failed"
+		fmt.Printf("%v\n", job)
+	}
+
+	mux.Lock()
+	jobs[job_id] = job
+	mux.Unlock()
+
+	return true
+}
+
+// Stuff regarding the function above; Commands
+
+func (job *Job) echo() {
+	job.Result = job.Payload
+	job.Status = "completed"
+}
+
+func (job *Job) evaluate() {
+	code, err := expr.Compile(job.Payload, expr.AsBool())
+	if err != nil {
+		log.Println(err.Error())
+		job.Result = "invalid expression"
+		job.Status = "failed"
+		return
+	}
+
+	result, err := expr.Run(code, nil)
+	if err != nil {
+		log.Println(err.Error())
+		job.Result = "invalid expression"
+		job.Status = "failed"
+		return
+	}
+
+	if _, ok := result.(bool); !ok {
+		log.Println(result)
+		job.Result = "invalid expression"
+		job.Status = "failed"
+		return
+	}
+
+	job.Result = fmt.Sprint(result)
+	job.Status = "completed"
+}
+
+func BeginShutdown() {
+	submit_mux.Lock()
+	shuttingDown = true
+	submit_mux.Unlock()
+}
+
+func CloseJobQueue() {
+	close(jobQueue)
 }

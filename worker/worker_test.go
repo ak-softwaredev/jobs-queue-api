@@ -48,7 +48,7 @@ func TestPostJob_Success(t *testing.T) {
 	switch {
 	case job.JobId == "":
 		t.Fatalf("expected job_id to be set, got %s", job.JobId)
-	case job.Result != "nil":
+	case job.Result != "":
 		t.Fatalf("expected result to be nil, got %s", job.Result)
 	case job.Status != "queued":
 		t.Fatalf("expected status to be queued, got %s", job.Status)
@@ -105,6 +105,33 @@ func TestPostJob_UnsupportedType(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rec.Code)
 	}
+}
+
+func TestPostJob_QueueFull(t *testing.T) {
+	for range cap(jobQueue) - 1 {
+		jobQueue <- "test"
+	}
+
+	body := `{"type":"echo","payload":"testing queue full"}`
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/jobs",
+		strings.NewReader(body),
+	)
+	rec := httptest.NewRecorder()
+
+	PostJob(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
+	}
+
+	t.Cleanup(func() {
+		for range cap(jobQueue) - 1 {
+			var _ = <-jobQueue
+		}
+	})
 }
 
 /*
@@ -185,6 +212,12 @@ func TestGetJob_NotFound(t *testing.T) {
 	}
 }
 
+/*
+DeleteJob test
+DELETE /jobs/:id -> CODE
+Test for wrong codes or deletion of nonexistent resource
+*/
+
 func TestDeleteJob_Success(t *testing.T) {
 	mux.Lock()
 	jobs[deleteJob] = Job{
@@ -239,5 +272,162 @@ func TestDeleteJob_NotFound(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected status code %d, got %d", http.StatusNotFound, rec.Code)
+	}
+}
+
+/*
+jobCycle test
+jobCycle(debug_job) -> look jobs[debug_job]
+Test for potential wrong functionality
+*/
+
+func TestWorker_EchoSuccess(t *testing.T) {
+	job := Job{
+		JobId:   "test-echo",
+		Type:    "echo",
+		Payload: "test echo success",
+		Status:  "queued",
+		Result:  "",
+	}
+
+	mux.Lock()
+	jobs[job.JobId] = job
+	mux.Unlock()
+
+	succ := jobCycle(job.JobId)
+	if !succ {
+		t.Fatalf("expected success, got failure")
+	}
+
+	mux.RLock()
+	done_job := jobs[job.JobId]
+	mux.RUnlock()
+
+	switch {
+	case done_job.Status != "completed":
+		t.Fatalf("expected status %s, got %s", "completed", done_job.Status)
+	case done_job.Type != job.Type:
+		t.Fatalf("expected type %s, got %s", job.Type, done_job.Type)
+	case done_job.Payload != job.Payload:
+		t.Fatalf("expected payload %s, got %s", job.Payload, done_job.Payload)
+	case done_job.Result != done_job.Payload:
+		t.Fatalf("expected result %s, got %s", done_job.Payload, done_job.Result)
+	}
+}
+
+func TestWorker_ExprSuccessTrue(t *testing.T) {
+	job := Job{
+		JobId:   "test-expr-success",
+		Type:    "eval",
+		Payload: "50 >= 40",
+		Status:  "queued",
+		Result:  "",
+	}
+
+	mux.Lock()
+	jobs[job.JobId] = job
+	mux.Unlock()
+
+	succ := jobCycle(job.JobId)
+	if !succ {
+		t.Fatalf("expected success, got failure")
+	}
+
+	mux.RLock()
+	done_job := jobs[job.JobId]
+	mux.RUnlock()
+
+	switch {
+	case done_job.Status != "completed":
+		t.Fatalf("expected status %s, got %s", "completed", done_job.Status)
+	case done_job.Type != job.Type:
+		t.Fatalf("expected type %s, got %s", job.Type, done_job.Type)
+	case done_job.Payload != job.Payload:
+		t.Fatalf("expected payload %s, got %s", job.Payload, done_job.Payload)
+	case done_job.Result != "true":
+		t.Fatalf("expected result %s, got %s", "true", done_job.Result)
+	}
+}
+
+func TestWorker_ExprSuccessFalse(t *testing.T) {
+	job := Job{
+		JobId:   "test-expr-success",
+		Type:    "eval",
+		Payload: "50 >= 60",
+		Status:  "queued",
+		Result:  "",
+	}
+
+	mux.Lock()
+	jobs[job.JobId] = job
+	mux.Unlock()
+
+	succ := jobCycle(job.JobId)
+	if !succ {
+		t.Fatalf("expected success, got failure")
+	}
+
+	mux.RLock()
+	done_job := jobs[job.JobId]
+	mux.RUnlock()
+
+	switch {
+	case done_job.Status != "completed":
+		t.Fatalf("expected status %s, got %s", "completed", done_job.Status)
+	case done_job.Type != job.Type:
+		t.Fatalf("expected type %s, got %s", job.Type, done_job.Type)
+	case done_job.Payload != job.Payload:
+		t.Fatalf("expected payload %s, got %s", job.Payload, done_job.Payload)
+	case done_job.Result != "false":
+		t.Fatalf("expected result %s, got %s", "false", done_job.Result)
+	}
+}
+
+func TestWorker_ExprFailure(t *testing.T) {
+	job := Job{
+		JobId:   "test-expr-success",
+		Type:    "eval",
+		Payload: "50 >= nonexistent_variable",
+		Status:  "queued",
+		Result:  "",
+	}
+
+	mux.Lock()
+	jobs[job.JobId] = job
+	mux.Unlock()
+
+	succ := jobCycle(job.JobId)
+	if !succ {
+		t.Fatalf("expected success, got failure")
+	}
+
+	mux.RLock()
+	done_job := jobs[job.JobId]
+	mux.RUnlock()
+
+	switch {
+	case done_job.Status != "failed":
+		t.Fatalf("expected status %s, got %s", "failed", done_job.Status)
+	case done_job.Type != job.Type:
+		t.Fatalf("expected type %s, got %s", job.Type, done_job.Type)
+	case done_job.Payload != job.Payload:
+		t.Fatalf("expected payload %s, got %s", job.Payload, done_job.Payload)
+	case done_job.Result != "invalid expression":
+		t.Fatalf("expected result %s, got %s", "invalid expression", done_job.Result)
+	}
+}
+
+func TestWorker_JobNotFound(t *testing.T) {
+	job := Job{
+		JobId:   "nonexistent-job",
+		Type:    "echo",
+		Payload: "nonexistent job",
+		Status:  "queued",
+		Result:  "",
+	}
+
+	succ := jobCycle(job.JobId)
+	if succ {
+		t.Fatalf("expected failure, got success")
 	}
 }
